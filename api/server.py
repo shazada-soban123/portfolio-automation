@@ -1,0 +1,408 @@
+"""
+Portfolio Website Automation - API Server
+Complete ready-to-deploy webhook server
+"""
+
+from flask import Flask, request, jsonify
+import subprocess
+import os
+import json
+import logging
+import shutil
+from datetime import datetime
+
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Configuration from environment variables
+GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN', '')
+GITHUB_USERNAME = os.environ.get('GITHUB_USERNAME', 'shazada-soban123')
+ADMIN_EMAIL = os.environ.get('ADMIN_EMAIL', 'sobanluminai@gmail.com')
+SENDER_EMAIL = os.environ.get('SENDER_EMAIL', 'sobanluminai@gmail.com')
+SENDER_PASSWORD = os.environ.get('SENDER_PASSWORD', '')
+CALENDLY_LINK = 'https://cal.com/shazada-soban/quick-chat?overlayCalendar=true'
+
+# Base paths
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+WEBSITE_GENERATOR_DIR = os.path.join(BASE_DIR, 'website-generator')
+WEBSITES_DIR = '/tmp/portfolios'
+
+
+@app.route('/webhook', methods=['POST'])
+def handle_webhook():
+    """
+    Webhook endpoint called by Google Apps Script when a new row is added
+    """
+    try:
+        data = request.json
+        logger.info(f"=== NEW PORTFOLIO REQUEST ===")
+        logger.info(f"Name: {data.get('full_name', 'Unknown')}")
+        logger.info(f"Email: {data.get('email', 'Unknown')}")
+        logger.info(f"Niche: {data.get('niche', 'Unknown')}")
+
+        # Validate required fields
+        required_fields = ['full_name', 'email', 'niche', 'services']
+        for field in required_fields:
+            if field not in data or not data[field]:
+                return jsonify({'error': f'Missing required field: {field}'}), 400
+
+        # Step 1: Generate portfolio website
+        logger.info("Step 1/3: Generating portfolio website...")
+        portfolio_result = create_portfolio_website(data)
+
+        if not portfolio_result['success']:
+            return jsonify({'error': f'Website generation failed: {portfolio_result.get("error")}'}), 500
+
+        website_path = portfolio_result['website_path']
+        logger.info(f"Website generated at: {website_path}")
+
+        # Step 2: Deploy to GitHub
+        logger.info("Step 2/3: Deploying to GitHub...")
+        github_result = deploy_to_github(data, website_path)
+
+        if not github_result['success']:
+            return jsonify({'error': f'GitHub deployment failed: {github_result.get("error")}'}), 500
+
+        website_url = github_result.get('website_url')
+        repo_url = github_result.get('repo_url')
+        logger.info(f"Deployed! URL: {website_url}")
+
+        # Step 3: Send notification emails
+        logger.info("Step 3/3: Sending notification emails...")
+        email_results = send_notification_emails(data, website_url)
+
+        logger.info(f"=== PORTFOLIO COMPLETE ===")
+        logger.info(f"Website: {website_url}")
+
+        return jsonify({
+            'success': True,
+            'message': 'Portfolio created and deployed successfully!',
+            'website_url': website_url,
+            'repo_url': repo_url,
+            'email_results': email_results
+        })
+
+    except Exception as e:
+        logger.error(f"Error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+def create_portfolio_website(data):
+    """Generate the portfolio website"""
+    try:
+        os.makedirs(WEBSITES_DIR, exist_ok=True)
+
+        # Import and run the website generator
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("generate", os.path.join(WEBSITE_GENERATOR_DIR, 'generate.py'))
+        generate_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(generate_module)
+
+        result = generate_module.generate_portfolio(data)
+
+        if result['success']:
+            return {'success': True, 'website_path': result['path']}
+        else:
+            return {'success': False, 'error': result.get('error', 'Unknown error')}
+
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+
+def deploy_to_github(data, website_path):
+    """Create GitHub repository and push files"""
+    try:
+        import requests
+
+        email_slug = data['email'].split('@')[0].replace('.', '-').lower()
+        repo_name = f'portfolio-{email_slug}'
+        repo_url = f'https://github.com/{GITHUB_USERNAME}/{repo_name}'
+        website_url = f'https://{GITHUB_USERNAME}.github.io/{repo_name}/'
+
+        # GitHub API headers
+        headers = {
+            'Authorization': f'token {GITHUB_TOKEN}',
+            'Accept': 'application/vnd.github.v3+json'
+        }
+
+        # Create repository
+        logger.info(f"Creating repository: {repo_name}")
+        create_repo_url = 'https://api.github.com/user/repos'
+        repo_data = {
+            'name': repo_name,
+            'description': f"Portfolio website for {data['full_name']} - Generated by Portfolio Automation",
+            'private': False,
+            'auto_init': True,
+            'has_wiki': False,
+            'has_issues': True
+        }
+
+        response = requests.post(create_repo_url, headers=headers, json=repo_data)
+        logger.info(f"Repository creation response: {response.status_code}")
+
+        # Wait a moment for repo to initialize
+        import time
+        time.sleep(2)
+
+        # Clone the repository
+        temp_clone = f'/tmp/{repo_name}'
+        clone_url = f'https://{GITHUB_TOKEN}@github.com/{GITHUB_USERNAME}/{repo_name}.git'
+
+        # Clean up any existing temp directory
+        subprocess.run(['rm', '-rf', temp_clone], capture_output=True)
+
+        logger.info("Cloning repository...")
+        result = subprocess.run(
+            ['git', 'clone', '--depth', '1', clone_url, temp_clone],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+
+        if result.returncode != 0:
+            logger.error(f"Clone failed: {result.stderr}")
+            # Try without --depth for reliability
+            result = subprocess.run(
+                ['git', 'clone', clone_url, temp_clone],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+
+        if result.returncode != 0:
+            logger.error(f"Clone failed again: {result.stderr}")
+            return {'success': False, 'error': f"Git clone failed: {result.stderr}"}
+
+        # Copy website files to repo
+        logger.info("Copying website files...")
+        for item in os.listdir(website_path):
+            src = os.path.join(website_path, item)
+            dst = os.path.join(temp_clone, item)
+            if os.path.isdir(src):
+                if os.path.exists(dst):
+                    shutil.rmtree(dst)
+                shutil.copytree(src, dst)
+            else:
+                shutil.copy2(src, dst)
+
+        # Configure git
+        subprocess.run(['git', 'config', 'user.email', 'automation@portfolio.dev'], cwd=temp_clone, check=True)
+        subprocess.run(['git', 'config', 'user.name', 'Portfolio Automation'], cwd=temp_clone, check=True)
+
+        # Add all files
+        subprocess.run(['git', '-C', temp_clone, 'add', '.'], check=True)
+
+        # Commit
+        subprocess.run(['git', '-C', temp_clone, 'commit', '-m', 'Add portfolio website'], check=True)
+
+        # Push
+        logger.info("Pushing to GitHub...")
+        push_result = subprocess.run(
+            ['git', '-C', temp_clone, 'push', 'origin', 'main'],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+
+        # If main doesn't exist, try master
+        if push_result.returncode != 0:
+            subprocess.run(['git', '-C', temp_clone, 'branch', '-M', 'main'], check=True)
+            push_result = subprocess.run(
+                ['git', '-C', temp_clone, 'push', 'origin', 'main', '-f'],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+
+        # Clean up
+        subprocess.run(['rm', '-rf', temp_clone], capture_output=True)
+
+        if push_result.returncode == 0:
+            logger.info(f"Successfully pushed to {repo_url}")
+            return {
+                'success': True,
+                'repo_url': repo_url,
+                'website_url': website_url
+            }
+        else:
+            return {'success': False, 'error': f"Push failed: {push_result.stderr}"}
+
+    except Exception as e:
+        logger.error(f"GitHub deployment error: {str(e)}")
+        return {'success': False, 'error': str(e)}
+
+
+def send_notification_emails(data, website_url):
+    """Send notification emails to both freelancer and admin"""
+    results = []
+
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+
+        def send_email(to_email, subject, html_content):
+            try:
+                msg = MIMEMultipart('alternative')
+                msg['Subject'] = subject
+                msg['From'] = SENDER_EMAIL
+                msg['To'] = to_email
+
+                html_part = MIMEText(html_content, 'html')
+                msg.attach(html_part)
+
+                with smtplib.SMTP('smtp.gmail.com', 587) as server:
+                    server.starttls()
+                    server.login(SENDER_EMAIL, SENDER_PASSWORD)
+                    server.sendmail(SENDER_EMAIL, to_email, msg.as_string())
+
+                logger.info(f"Email sent to {to_email}")
+                return {'to': to_email, 'status': 'sent'}
+            except Exception as e:
+                logger.error(f"Email error to {to_email}: {str(e)}")
+                return {'to': to_email, 'status': 'failed', 'error': str(e)}
+
+        # Email to Freelancer
+        freelancer_html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body {{ font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; }}
+        .header {{ background: linear-gradient(135deg, #6366f1, #8b5cf6); color: white; padding: 40px; text-align: center; border-radius: 16px 16px 0 0; }}
+        .content {{ background: #f8fafc; padding: 40px; border-radius: 0 0 16px 16px; }}
+        .website-link {{ display: inline-block; background: linear-gradient(135deg, #6366f1, #8b5cf6); color: white; padding: 20px 40px; text-decoration: none; font-size: 18px; font-weight: 600; border-radius: 12px; margin: 20px 0; }}
+        .cta-button {{ display: inline-block; background: #10b981; color: white; padding: 16px 32px; text-decoration: none; font-weight: 600; border-radius: 8px; margin-top: 20px; }}
+        .footer {{ text-align: center; padding: 20px; color: #64748b; font-size: 14px; }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🎉 Your Portfolio Website is Ready!</h1>
+    </div>
+    <div class="content">
+        <h2>Hi {data.get('full_name', 'there')}!</h2>
+        <p>Great news! Your professional portfolio website has been generated and is now live.</p>
+
+        <p style="text-align: center;">
+            <a href="{website_url}" class="website-link">🔗 View Your Website: {website_url}</a>
+        </p>
+
+        <h3>📅 Want This Website With Your Own Domain?</h3>
+        <p>If you'd like to get this website with your own custom domain (like yourname.com), let's schedule a quick call:</p>
+        <p style="text-align: center;">
+            <a href="{CALENDLY_LINK}" class="cta-button">📅 Book a Free 15-Min Call</a>
+        </p>
+
+        <p>Best regards,<br>The Portfolio Team</p>
+    </div>
+    <div class="footer">
+        <p>© {datetime.now().year} Portfolio Automation</p>
+    </div>
+</body>
+</html>
+"""
+
+        results.append(send_email(
+            data['email'],
+            "Your Portfolio Website is Ready! 🚀",
+            freelancer_html
+        ))
+
+        # Email to Admin
+        admin_html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body {{ font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; }}
+        .header {{ background: #0f172a; color: white; padding: 30px; text-align: center; border-radius: 16px 16px 0 0; }}
+        .content {{ background: #f8fafc; padding: 30px; border-radius: 0 0 16px 16px; }}
+        .info-row {{ display: flex; padding: 12px 0; border-bottom: 1px solid #e2e8f0; }}
+        .info-label {{ font-weight: 600; width: 140px; color: #475569; }}
+        .info-value {{ flex: 1; color: #0f172a; }}
+        .badge {{ background: #10b981; color: white; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; display: inline-block; margin-top: 10px; }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>📋 New Portfolio Created</h1>
+        <span class="badge">Automated</span>
+    </div>
+    <div class="content">
+        <p><strong>Time:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+
+        <h2>Freelancer Details</h2>
+        <div class="info-row">
+            <span class="info-label">Name:</span>
+            <span class="info-value">{data.get('full_name', 'N/A')}</span>
+        </div>
+        <div class="info-row">
+            <span class="info-label">Email:</span>
+            <span class="info-value">{data.get('email', 'N/A')}</span>
+        </div>
+        <div class="info-row">
+            <span class="info-label">Niche:</span>
+            <span class="info-value">{data.get('niche', 'N/A')}</span>
+        </div>
+        <div class="info-row">
+            <span class="info-label">Services:</span>
+            <span class="info-value">{data.get('services', 'N/A')}</span>
+        </div>
+
+        <h2>Website</h2>
+        <p><strong>Preview:</strong> <a href="{website_url}">{website_url}</a></p>
+
+        <p style="margin-top: 30px;">
+            <a href="{CALENDLY_LINK}" style="background: #6366f1; color: white; padding: 12px 24px; text-decoration: none; border-radius: 8px; display: inline-block;">
+                📅 Book a Call with Client
+            </a>
+        </p>
+    </div>
+</body>
+</html>
+"""
+
+        results.append(send_email(
+            ADMIN_EMAIL,
+            f"New Portfolio: {data.get('full_name', 'Unknown')}",
+            admin_html
+        ))
+
+    except Exception as e:
+        logger.error(f"Email system error: {str(e)}")
+        results.append({'status': 'error', 'message': str(e)})
+
+    return results
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'github_username': GITHUB_USERNAME
+    })
+
+
+@app.route('/', methods=['GET'])
+def index():
+    """Home page"""
+    return jsonify({
+        'name': 'Portfolio Automation API',
+        'version': '1.0.0',
+        'endpoints': {
+            'webhook': 'POST /webhook',
+            'health': 'GET /health'
+        }
+    })
+
+
+if __name__ == '__main__':
+    logger.info("Starting Portfolio Automation API...")
+    logger.info(f"GitHub Username: {GITHUB_USERNAME}")
+    app.run(host='0.0.0.0', port=5000)

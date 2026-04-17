@@ -1,0 +1,17 @@
+# Nixpacks Configuration for Python/Flask
+# This tells Railway how to build and run your app
+
+providers = ["python"]
+
+[python]
+version = "3.11"
+
+[nixpacks.envs]
+PORT = "5000"
+PYTHONUNBUFFERED = "1"
+
+[nixpacks.setup]
+pip install -r requirements.txt
+
+[nixpacks.start]
+cmd = "gunicorn api.server:app --bind 0.0.0.0:${PORT} --workers 2 --timeout 120"
